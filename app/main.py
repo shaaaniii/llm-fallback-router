@@ -1,147 +1,65 @@
 """
-Phase 1 — Your First LLM Application
---------------------------------------
-A tiny CLI that:
-  1. Reads your Groq API key from a .env file (never hardcoded).
-  2. Sends whatever you type to an LLM via Groq.
-  3. Prints the generated text + token usage.
-  4. Doesn't crash on bad input, bad keys, timeouts, or provider errors.
+Phase 2 — FastAPI service.
 
-Flow:
-    User input -> Python -> LLM (Groq API) -> Print response
+    Client -> FastAPI -> LLM -> Response
+
+Run with:
+    uvicorn app.main:app --reload
+
+Then open http://127.0.0.1:8000/docs for the interactive API docs.
 """
 
-import os
-import sys
+from fastapi import Depends, FastAPI
 
-from dotenv import load_dotenv
-import groq
+from app.auth import require_api_key
+from app.config import settings
+from app.llm_client import generate_chat_response
+from app.schemas import ChatRequest, ChatResponse, ErrorResponse
 
-
-# ---------------------------------------------------------------------------
-# Step 6: Load environment variables (.env -> environment -> Python)
-# ---------------------------------------------------------------------------
-load_dotenv()  # reads the .env file sitting next to this project and loads
-               # its key=value pairs into os.environ
-
-API_KEY = os.getenv("LLM_API_KEY")
-MODEL_NAME = os.getenv("LLM_MODEL", "openai/gpt-oss-20b")  # sane default
-print("DEBUG MODEL:", MODEL_NAME)
-print("DEBUG API KEY LOADED:", bool(API_KEY))
-
-if not API_KEY:
-    # Fail loudly and clearly at startup rather than deep inside a request.
-    print("ERROR: LLM_API_KEY not found. Did you create a .env file?")
-    print("See README.md for setup instructions.")
-    sys.exit(1)
+app = FastAPI(
+    title="LLM Fallback Router",
+    description="A minimal AI backend. Phase 2: single provider behind a REST API.",
+    version="0.2.0",
+)
 
 
-# ---------------------------------------------------------------------------
-# Step 4/5: One function = one LLM request.
-# This is the entire "how do I call an LLM" answer.
-# ---------------------------------------------------------------------------
-def ask_llm(client: groq.Groq, user_message: str):
+@app.get("/health", tags=["system"])
+async def health():
     """
-    Sends a single user message to the LLM and returns (text, usage_dict).
-    Returns (None, None) if something went wrong (error already printed).
+    Unauthenticated liveness check.
+
+    Every real backend needs one of these — load balancers and deploy
+    platforms hit it to decide whether your service is alive.
     """
-    try:
-        response = client.chat.completions.create(
-            model=MODEL_NAME,
-            max_tokens=1024,
-            messages=[
-                {"role": "user", "content": user_message}
-            ],
-            timeout=30.0,  # Step 7: don't hang forever
-        )
-
-    # --- Step 7: Handle the realistic failure modes -----------------------
-    except groq.AuthenticationError:
-        print("Error: your API key was rejected. Check LLM_API_KEY in .env.")
-        return None, None
-
-    except groq.APITimeoutError:
-        print("Error: the request timed out. Try again in a moment.")
-        return None, None
-
-    except groq.APIConnectionError:
-        print("Error: could not reach the provider. Check your internet connection.")
-        return None, None
-
-    except groq.RateLimitError:
-        print("Error: rate limit hit. Wait a bit and try again.")
-        return None, None
-
-    except groq.APIStatusError as e:
-        # Catch-all for other 4xx/5xx responses from the provider
-        print(f"Error: provider returned an error (status {e.status_code}).")
-        print(f"Details: {e.message}")
-        return None, None
-
-    except Exception as e:
-        # Last-resort safety net so the program never crashes ugly
-        print(f"Unexpected error: {e}")
-        return None, None
-
-    # --- Step 8: Extract the useful parts, don't dump the raw object ------
-    try:
-        generated_text = response.choices[0].message.content
-    except (IndexError, AttributeError):
-        print("Error: response came back in an unexpected/malformed shape.")
-        return None, None
-
-    usage = {
-        "input_tokens": getattr(response.usage, "prompt_tokens", None),
-        "output_tokens": getattr(response.usage, "completion_tokens", None),
-    }
-    if usage["input_tokens"] is not None and usage["output_tokens"] is not None:
-        usage["total_tokens"] = usage["input_tokens"] + usage["output_tokens"]
-    else:
-        usage["total_tokens"] = None
-
-    return generated_text, usage
+    return {"status": "ok", "model": settings.LLM_MODEL}
 
 
-# ---------------------------------------------------------------------------
-# Step 9: Turn it into a tiny interactive CLI
-# ---------------------------------------------------------------------------
-def main():
-    client = groq.Groq(api_key=API_KEY)
+@app.post(
+    "/v1/chat",
+    response_model=ChatResponse,        # <- output is validated/filtered to this shape
+    dependencies=[Depends(require_api_key)],  # <- auth runs before the body below
+    tags=["chat"],
+    responses={                          # <- documents the error shapes in /docs
+        401: {"model": ErrorResponse, "description": "Missing or invalid API key"},
+        422: {"description": "Validation error (e.g. empty message)"},
+        429: {"model": ErrorResponse, "description": "Upstream rate limit"},
+        502: {"model": ErrorResponse, "description": "Upstream provider error"},
+        503: {"model": ErrorResponse, "description": "Upstream unreachable"},
+        504: {"model": ErrorResponse, "description": "Upstream timeout"},
+    },
+)
+async def chat(payload: ChatRequest) -> ChatResponse:
+    """
+    Send a message to the LLM and get its reply.
 
-    print("=" * 50)
-    print("Tiny LLM CLI — type 'exit' or 'quit' to stop")
-    print("=" * 50)
-
-    while True:
-        try:
-            user_input = input("\n> Ask something: ").strip()
-        except (KeyboardInterrupt, EOFError):
-            print("\nGoodbye.")
-            break
-
-        if user_input.lower() in ("exit", "quit"):
-            print("Goodbye.")
-            break
-
-        # Step 10: handle the empty-input edge case explicitly
-        if not user_input:
-            print("(empty input — type a question first)")
-            continue
-
-        text, usage = ask_llm(client, user_input)
-
-        if text is None:
-            # Error already printed inside ask_llm; loop continues
-            continue
-
-        print(f"\nAnswer: {text}")
-
-        if usage["total_tokens"] is not None:
-            print("\nUsage:")
-            print(f"  Input tokens:  {usage['input_tokens']}")
-            print(f"  Output tokens: {usage['output_tokens']}")
-            print(f"  Total tokens:  {usage['total_tokens']}")
-
-
-if __name__ == "__main__":
-    main()
+    Note how little happens here. That's intentional:
+      - validation      -> handled by ChatRequest
+      - authentication  -> handled by the dependency
+      - provider errors -> handled inside generate_chat_response
+    The route only wires things together. This is what keeps a backend
+    maintainable as it grows.
+    """
+    return await generate_chat_response(
+        message=payload.message,
+        model=payload.model,
+    )
