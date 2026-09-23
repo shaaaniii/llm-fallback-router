@@ -108,7 +108,8 @@ class ChatResponse(BaseModel):
 
     `provider` is reported for transparency and debugging — but the client
     is never REQUIRED to look at it. Same request shape, same response
-    shape, whichever backend answered.
+    shape, whichever backend answered, however many providers were tried
+    internally before one succeeded.
     """
 
     model_config = ConfigDict(
@@ -119,6 +120,7 @@ class ChatResponse(BaseModel):
                     "provider": "groq",
                     "model": "llama-3.1-8b-instant",
                     "usage": {"input_tokens": 12, "output_tokens": 74, "total_tokens": 86},
+                    "cost_usd": 0.00000682,
                 }
             ]
         }
@@ -128,6 +130,7 @@ class ChatResponse(BaseModel):
     provider: str = Field(description="Which provider actually served this request.")
     model: str = Field(description="The model that served this request.")
     usage: Usage | None = Field(default=None, description="Token usage, when reported.")
+    cost_usd: float | None = Field(default=None, description="Estimated cost in USD for this request.")
 
 
 class ErrorResponse(BaseModel):

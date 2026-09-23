@@ -10,7 +10,6 @@ checks into every route.
 """
 
 import secrets
-
 from fastapi import HTTPException, Security
 from fastapi.security import APIKeyHeader
 

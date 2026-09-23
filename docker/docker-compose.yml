@@ -1,0 +1,53 @@
+services:
+  # The gateway itself.
+  app:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "8000:8000"
+    env_file:
+      - ../.env
+    environment:
+      # Override the .env defaults to point at the OTHER containers below.
+      # "redis"/"postgres" resolve via Docker's internal DNS — they are
+      # the service names defined in this same file, not localhost.
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/llm_router
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Circuit breaker + rate limiter state, shared across every app replica.
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Request log persistence.
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: llm_router
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  pgdata:
