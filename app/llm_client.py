@@ -1,100 +1,78 @@
 """
-The LLM layer.
+Compatibility layer between FastAPI and the Phase 3 router.
 
-This is Phase 1's ask_llm() function, with two changes:
-  1. It is ASYNC (uses AsyncGroq) so FastAPI can serve other requests
-     while this one waits on the network.
-  2. Instead of print()-ing errors, it RAISES HTTPException so FastAPI
-     turns them into proper HTTP status codes.
-
-Keeping this in its own file matters: Phase 3 swaps this single module
-for a multi-provider router without touching main.py at all.
+The route in main.py continues calling generate_chat_response(),
+but the actual provider selection is now handled by Router.
 """
-import groq
-from openai import AsyncOpenAI
+
 from fastapi import HTTPException
 
-from app.config import settings
+from app.providers.base import (
+    ProviderAuthError,
+    ProviderBadRequest,
+    ProviderBadResponse,
+    ProviderError,
+    ProviderRateLimited,
+    ProviderTimeout,
+    LLMProvider,
+    ProviderResult,
+    ProviderUnavailable,
+)
+from app.router import RoutingError, router
 from app.schemas import ChatResponse, Usage
 
-# One client for the whole app lifetime.
-# Creating a client per request would waste connections.
-client = groq.AsyncGroq(api_key=settings.LLM_API_KEY)
+# Each ProviderError subtype -> the HTTP status it should surface as.
+# Checked most-specific-first isinstance() would also work, but a dict
+# keyed by exact type is O(1) and just as correct here since providers
+# only ever raise these concrete subtypes, never the base class directly.
+_STATUS_MAP: dict[type[ProviderError], int] = {
+    ProviderRateLimited: 429,
+    ProviderTimeout: 504,
+    ProviderUnavailable: 503,
+    ProviderAuthError: 502,   # our upstream credential — not the caller's fault
+    ProviderBadRequest: 502,  # we sent the provider something invalid
+    ProviderBadResponse: 502,  # provider replied with something unparseable
+}
 
 
-async def generate_chat_response(message: str, model: str | None = None) -> ChatResponse:
+async def generate_chat_response(
+    message: str,
+    provider: str | None = None,
+    tier: str | None = None,
+    model: str | None = None,
+) -> ChatResponse:
     """
-    Send one message to the LLM and return a validated ChatResponse.
-
-    Raises HTTPException on any failure — FastAPI converts that into
-    a JSON error response with the right status code.
+    Route the request through the Phase 3 provider router.
     """
-    model_name = model or settings.LLM_MODEL
-
     try:
-        # `await` = "pause this request here, let the server handle others,
-        #            resume when the provider replies"
-        completion = await client.chat.completions.create(
-            model=model_name,
-            max_tokens=settings.LLM_MAX_TOKENS,
-            messages=[{"role": "user", "content": message}],
-            timeout=settings.LLM_TIMEOUT,
+        result = await router.generate(
+            message=message,
+            provider=provider,
+            tier=tier,
+            model=model,
         )
 
-    # --- Map provider errors -> HTTP status codes ------------------------
-    except groq.AuthenticationError:
-        # 502: the client's request was fine; OUR upstream credential is broken.
-        raise HTTPException(
-            status_code=502,
-            detail="Upstream provider rejected the server's credentials.",
-        )
+    except RoutingError as e:
+        # Caller/configuration error: unknown tier, unknown provider,
+        # or a tier with no API key configured for it.
+        raise HTTPException(status_code=400, detail=str(e))
 
-    except groq.APITimeoutError:
-        raise HTTPException(
-            status_code=504,
-            detail="Upstream provider timed out.",
-        )
+    except ProviderError as e:
+        # Normalized provider failure -> its mapped status code.
+        # type(e) is exact because RoutingError above already intercepted
+        # the non-provider case; anything reaching here IS one of the
+        # concrete subtypes in _STATUS_MAP.
+        status = _STATUS_MAP.get(type(e), 502)
+        raise HTTPException(status_code=status, detail=f"Provider '{e.provider}' failed: {e.message}")
 
-    except groq.APIConnectionError:
-        raise HTTPException(
-            status_code=503,
-            detail="Could not reach the upstream provider.",
-        )
+    # Anything else is a genuine bug, not a modeled failure — let it
+    # propagate as a real 500 with a traceback instead of masking it here.
 
-    except groq.RateLimitError:
-        raise HTTPException(
-            status_code=429,
-            detail="Rate limit reached at the upstream provider. Try again shortly.",
-        )
+    usage = Usage.from_counts(result.input_tokens, result.output_tokens)
 
-    except groq.APIStatusError as e:
-        # e.g. 404 for an unknown model name — surface the real reason.
-        raise HTTPException(
-            status_code=502,
-            detail=f"Upstream provider error ({e.status_code}): {e.message}",
-        )
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Unexpected error while generating a response: {e}",
-        )
-
-    # --- Extract the useful parts ----------------------------------------
-    try:
-        text = completion.choices[0].message.content
-    except (IndexError, AttributeError):
-        raise HTTPException(
-            status_code=502,
-            detail="Upstream provider returned a malformed response.",
-        )
-
-    usage = None
-    if completion.usage:
-        usage = Usage(
-            input_tokens=completion.usage.prompt_tokens,
-            output_tokens=completion.usage.completion_tokens,
-            total_tokens=completion.usage.total_tokens,
-        )
-
-    return ChatResponse(response=text, model=model_name, usage=usage)
+    return ChatResponse(
+        response=result.text,
+        provider=result.provider,
+        model=result.model,
+        usage=usage,
+    )
