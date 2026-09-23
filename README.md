@@ -561,7 +561,7 @@ llm-fallback-router/
 │   ├── schemas.py           # request/response contract
 │   ├── auth.py              # X-API-Key dependency          (Phase 2/3)
 │   ├── rate_limit.py        # Redis + in-memory rate limiters (Phase 5)
-│   ├── rate_limit_dep.py    # the FastAPI dependency for it   (Phase 5)
+│   ├── rate_limit_depen.py    # the FastAPI dependency for it   (Phase 5)
 │   ├── retry.py             # exponential backoff + jitter    (Phase 4)
 │   ├── circuit_breaker.py   # Redis + in-memory health stores (Phase 4)
 │   ├── router.py            # fallback chains + retry + breaker (Phase 4)
@@ -803,7 +803,7 @@ Same request/response shape as Phase 3, plus `cost_usd` in the response:
 ## Testing
 
 ```bash
-pytest -v
+pytest -m pytest -v
 ```
 
 21 tests, all running against fakes/in-memory stores — no network, no
